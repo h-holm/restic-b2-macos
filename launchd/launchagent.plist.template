@@ -1,0 +1,45 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  The template of the LaunchAgent that runs bin/backup every day at SCHEDULE_TIME (.env).
+  Don't install this file: `bin/schedule install` fills in the @...@ fields (launchd needs
+  absolute paths) and writes the result to ~/Library/LaunchAgents/@LABEL@.plist.
+  `bin/schedule show` prints what it would write.
+
+  The job runs only while its user is logged in (a locked screen is fine), which is also
+  when external drives are mounted and the login keychain is unlocked. If the Mac is
+  asleep at the scheduled time, the run happens when it wakes; if it is switched off, the
+  run is skipped. bin/backup writes its own log; the file named below only catches what
+  goes wrong before the script can log.
+
+  The job starts restic-b2-launcher, not bash, so that macOS asks once for access to
+  external drives and remembers it for that program alone. See README.md, "macOS privacy".
+-->
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>@LABEL@</string>
+
+  <key>ProgramArguments</key>
+  <array>
+    <string>@LAUNCHER@</string>
+  </array>
+
+  <key>StartCalendarInterval</key>
+  <dict>
+    <key>Hour</key>
+    <integer>@HOUR@</integer>
+    <key>Minute</key>
+    <integer>@MINUTE@</integer>
+  </dict>
+  <key>RunAtLoad</key>
+  <false/>
+  <key>ProcessType</key>
+  <string>Background</string>
+
+  <key>StandardOutPath</key>
+  <string>/dev/null</string>
+  <key>StandardErrorPath</key>
+  <string>@LAUNCHD_LOG@</string>
+</dict>
+</plist>
