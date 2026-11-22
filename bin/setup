@@ -1,0 +1,207 @@
+#!/bin/bash
+#
+# setup: the one-time setup of the B2 key, the repository password and the restic
+# repository for bin/backup.
+#
+# Run it interactively in a terminal: it shows the repository password once, so you can
+# write it down. Run it where nothing records the screen: the password must not end up
+# in a log, a recording or a screenshot.
+#
+# Before you start:
+#   - brew install restic b2-tools
+#   - the B2 bucket, made in the web UI: private, with the lifecycle rule "Keep prior
+#     versions for this number of days: 30"
+#   - RESTIC_REPOSITORY in .env (see .env.example)
+#   - your B2 master application key at hand (web UI, Application Keys). It is used to
+#     check the bucket and make a restricted key, then removed from this Mac again.
+#
+# What it does, skipping whatever is already done:
+#   1. checks the bucket: private, and hidden files are kept some days before B2 deletes
+#      them for good (the lifecycle rule)
+#   2. creates a B2 key for this bucket alone that can read, write and hide files but not
+#      delete them for good, and stores it in the login keychain
+#   3. creates the repository password (128 random bits), stores it in the login keychain,
+#      shows it once and has you type it back from what you wrote down
+#   4. restic init
+#   5. a self-test: a tiny backup, then forget and prune it, which proves restic works
+#      with a key that can't delete; then restic check
+#
+# Safe to run again: it keeps an existing key, password and repository.
+#
+# Written for the bash 3.2 that macOS ships as /bin/bash.
+
+set -euo pipefail
+export PATH=/opt/homebrew/bin:/usr/bin:/bin:/usr/sbin:/sbin:/usr/local/bin   # Homebrew: Apple Silicon, Intel
+umask 077
+
+REPO=$(cd "$(dirname "$0")/.." && pwd)
+readonly REPO
+# shellcheck source=lib/restic-env.sh
+. "$REPO/lib/restic-env.sh"
+
+readonly KEY_NAME=restic-b2-macos
+# No deleteFiles (delete a file version for good), no writeBuckets (change the lifecycle
+# rule), no key management.
+readonly CAPABILITIES=listBuckets,readBuckets,listFiles,readFiles,writeFiles
+
+say()  { printf '\n==> %s\n' "$*"; }
+fail() { printf '\nSTOPPED: %s\n' "$*" >&2; exit 1; }
+
+kc_store() {   # kc_store SERVICE LABEL VALUE
+    # The command goes to security on stdin (printf is a shell builtin): on a command line,
+    # any process could read the secret. security -i reports errors only as text, so the
+    # value is read back to be sure.
+    case $3 in
+        '' | *[!A-Za-z0-9+/=._-]*) fail "unexpected characters in the value for $1" ;;
+    esac
+    printf 'add-generic-password -U -a "%s" -s "%s" -l "%s" -w "%s"\n' \
+        "$KC_ACCOUNT" "$1" "$2" "$3" | security -i >/dev/null 2>&1 || true
+    [[ $(kc_read "$1") == "$3" ]] || fail "could not store $1 in the login keychain"
+}
+
+clear_screen() {
+    clear
+    printf '\033[3J'   # Terminal's scrollback too
+}
+
+if [[ ! -t 0 || ! -t 1 ]]; then
+    fail "run this in a Terminal window of your own: it asks questions and shows a password"
+fi
+for tool in restic b2 openssl; do
+    command -v "$tool" >/dev/null || fail "$tool is missing: brew install restic b2-tools"
+done
+load_repository || fail "$ENV_PROBLEM"
+readonly BUCKET=${RESTIC_REPOSITORY##*/}
+
+# --- 1 and 2: bucket check and the restricted B2 key ---------------------------------
+
+if kc_has "$KC_KEY_ID" && kc_has "$KC_KEY"; then
+    say "The B2 key is in the keychain already; keeping it."
+else
+    say "Log in to B2 with your MASTER application key (web UI, Application Keys). It is
+    only used to check bucket $BUCKET and to create the restricted key, and is removed
+    from this Mac afterwards."
+    trap 'b2 account clear >/dev/null 2>&1 || true' EXIT
+    read -r -p "Master application key ID: " master_id
+    read -r -s -p "Master application key (not shown): " master_key
+    echo
+    [[ -n $master_id && -n $master_key ]] || fail "both the key ID and the key are needed"
+    # Through the environment, not the command line, which any process can read. And
+    # b2 prints the key it logged in with, so its output goes nowhere.
+    B2_APPLICATION_KEY_ID=$master_id B2_APPLICATION_KEY=$master_key \
+        b2 account authorize >/dev/null || fail "B2 refused the master key"
+    unset master_id master_key
+
+    say "Checking bucket $BUCKET"
+    info=$(b2 bucket get "$BUCKET") || fail "B2 doesn't know bucket $BUCKET: check RESTIC_REPOSITORY in .env"
+    if ! grep -Eq '"bucketType": *"allPrivate"' <<<"$info"; then
+        grep -E '"bucketType"' <<<"$info" >&2 || true
+        fail "bucket $BUCKET is not private: make it private in the web UI"
+    fi
+    if ! grep -Eq '"daysFromHidingToDeleting": *[1-9]' <<<"$info"; then
+        grep -E -A1 -B1 '"daysFromHidingToDeleting"' <<<"$info" >&2 || true
+        fail "bucket $BUCKET has no lifecycle rule that keeps hidden files: in the web UI, Lifecycle Settings,
+         choose 'Keep prior versions for this number of days' and enter 30"
+    fi
+    echo "Private, and hidden files are kept before B2 deletes them. Good."
+
+    say "Creating key $KEY_NAME for bucket $BUCKET only: $CAPABILITIES"
+    created=$(b2 key create --bucket "$BUCKET" "$KEY_NAME" "$CAPABILITIES") || fail "b2 key create failed"
+    key_id=${created%% *}
+    key=${created#* }
+    if [[ -z $key_id || -z $key || $key == "$created" || $key == *' '* ]]; then
+        fail "unexpected output from b2 key create; the key may exist now: check Application Keys in the web UI"
+    fi
+    kc_store "$KC_KEY_ID" "restic-b2-macos: B2 key ID" "$key_id"
+    kc_store "$KC_KEY" "restic-b2-macos: B2 application key" "$key"
+    unset created key_id key
+
+    b2 account clear
+    trap - EXIT
+    echo "The key is in the login keychain, and the b2 tool has forgotten the master key."
+fi
+
+# --- 3: the repository password ------------------------------------------------------
+
+if kc_has "$KC_PASSWORD"; then
+    say "The repository password is in the keychain already; keeping it."
+else
+    password=$(openssl rand -hex 16)
+    kc_store "$KC_PASSWORD" "restic-b2-macos: restic repository password" "$password"
+    grouped=$(sed 's/..../& /g; s/ $//' <<<"$password")
+
+    clear_screen
+    cat <<EOF
+================================================================================
+ WRITE THIS DOWN, in your password manager and on paper away from this Mac.
+
+ Without the password nobody can ever read the backup again, not you either:
+ Backblaze only holds encrypted data and can't help. Keep it with RESTORE.md.
+
+   Repository:  $RESTIC_REPOSITORY
+   Password:    $grouped
+                (32 characters, 0-9 and a-f; type it without the spaces)
+   Unspaced:    $password
+                (the same, for a password manager)
+
+ To restore you also need your Backblaze login (password and 2FA).
+================================================================================
+EOF
+    answer=""
+    while [[ $answer != written ]]; do
+        read -r -p "Type 'written' once it is written down: " answer
+    done
+    clear_screen
+    tries=0
+    while :; do
+        read -r -s -p "Now type or paste the password from your paper or password manager: " typed
+        echo
+        typed=$(tr -d ' ' <<<"$typed" | tr 'A-F' 'a-f')
+        if [[ $typed == "$password" ]]; then
+            echo "Correct."
+            break
+        fi
+        tries=$(( tries + 1 ))
+        if (( tries >= 3 )); then
+            fail "that didn't match three times. The password is in the keychain (Keychain Access, item
+         $KC_PASSWORD): copy it from there, then run this script again."
+        fi
+        echo "That doesn't match; check what you wrote down and try again."
+    done
+    unset password grouped typed answer
+fi
+
+# --- 4: the repository ---------------------------------------------------------------
+
+load_secrets || fail "$ENV_PROBLEM"
+if restic cat config --no-lock >/dev/null 2>&1; then
+    say "The repository exists and the password opens it."
+else
+    say "restic init"
+    # If a repository exists but doesn't open with this password, init refuses too.
+    restic init || fail "restic init failed (see above)"
+fi
+
+# --- 5: self-test --------------------------------------------------------------------
+
+say "Self-test: a tiny backup, then forget and prune it, with the restricted key"
+tmp=$(mktemp -d)
+trap '/bin/rm -rf -- "$tmp"' EXIT
+date > "$tmp/self-test.txt"
+out=$(restic backup --tag setup-test "$tmp" 2>&1) || { echo "$out"; fail "the test backup failed"; }
+snapshot=$(sed -n 's/^snapshot \([0-9a-f]*\) saved$/\1/p' <<<"$out")
+[[ -n $snapshot ]] || { echo "$out"; fail "the test backup didn't report a snapshot"; }
+out=$(restic forget --prune "$snapshot" 2>&1) || { echo "$out"; fail "forget/prune of the test snapshot failed"; }
+if grep -Eqi 'returned error|unable to remove|access denied|unauthorized|forbidden' <<<"$out"; then
+    echo "$out"
+    fail "restic couldn't remove files with the restricted key. Don't start backups yet; see
+         README.md, \"If the self-test fails\"."
+fi
+echo "Backup, forget and prune work with the restricted key."
+restic check || fail "restic check failed (see above)"
+
+say "Setup done. Next:
+    1. bin/backup --dry-run
+    2. the first real run, from this Terminal; it uploads everything once, which can take hours:
+         bin/backup
+    3. the schedule: README.md, \"Schedule\""
