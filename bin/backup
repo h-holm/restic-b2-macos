@@ -1,0 +1,490 @@
+#!/bin/bash
+#
+# backup: the scheduled run of restic-b2-macos. Backs up the folders in BACKUP_PATHS (.env)
+# to a restic repository in a Backblaze B2 bucket, encrypted on this Mac.
+#
+#   bin/backup                 back up; once a week also prune and check
+#   bin/backup --maintenance   back up, then prune and check now
+#   bin/backup --dry-run       check everything and say what a run would do; changes
+#                              nothing in the backup (it reads the repository's config)
+#
+# A run, in order:
+#   1. preflight: the settings in .env; every folder in BACKUP_PATHS present, on a mounted
+#      volume and readable, with at least MIN_FILES files between them; the B2 key and the
+#      password in the login keychain; the repository answers and opens with the password.
+#      Any failure ends the run before anything is written.
+#   2. restic backup of BACKUP_PATHS. Only new or changed data is uploaded; moved or
+#      renamed files cost nothing, because restic recognises their content.
+#   3. maintenance, when the last one passed a week ago or more (or with --maintenance):
+#      restic forget --prune with the retention below, then restic check, which downloads
+#      CHECK_SUBSET of the stored data and verifies it.
+#   4. pushes over ntfy: "<BACKUP_NAME> backup FAILED" (high priority) on any failure, and
+#      "<BACKUP_NAME> backup OK" (low) after each maintenance, so about once a week.
+#      Optionally a healthchecks.io ping on every run, which also notices when runs stop
+#      happening.
+#
+# Everything restic uploads is encrypted on this Mac, file and folder names included. The
+# B2 key and the repository password come from the login keychain (lib/restic-env.sh);
+# this script never prints them. Pushes and pings carry counts and sizes, never paths or
+# names; the local log does name folders, and restic's messages there may name files.
+#
+# Log: ~/Library/Logs/restic-b2-macos.log. Settings: .env (git-ignored; see .env.example).
+#
+# Exit codes: 0 done, 1 failed (the log and the push say why), 2 wrong usage,
+# 75 another run is in progress.
+#
+# Written for the bash 3.2 that macOS ships as /bin/bash.
+
+set -euo pipefail
+export PATH=/opt/homebrew/bin:/usr/bin:/bin:/usr/sbin:/sbin:/usr/local/bin   # Homebrew: Apple Silicon, Intel
+export LC_ALL=C
+umask 077
+
+readonly TAG=scheduled           # on every snapshot this script makes
+# Maintenance is due when the last one is older than this: a week less an hour, so the
+# run at the same time a week later counts.
+readonly MAINTENANCE_AGE=167h
+readonly CHECK_SUBSET=5%
+# Retention, applied to all snapshots with TAG as one series, also when BACKUP_PATHS changes.
+KEEP=(--group-by "host,tags" --keep-daily 7 --keep-weekly 5 --keep-monthly 24 --keep-yearly 50)
+EXCLUDES=(--exclude .DS_Store --exclude '._*')
+readonly LOG=$HOME/Library/Logs/restic-b2-macos.log
+readonly STATE_DIR="$HOME/Library/Application Support/restic-b2-macos"
+readonly LOCK=$STATE_DIR/lock
+readonly MAINTAINED=$STATE_DIR/last-maintenance   # touched when a maintenance passes
+readonly RESTIC_OUT=$STATE_DIR/restic-output      # the last restic command's output
+
+SELF=$(cd "$(dirname "$0")" && pwd)/$(basename "$0")
+REPO=$(cd "$(dirname "$0")/.." && pwd)
+readonly SELF REPO
+# shellcheck source=lib/restic-env.sh
+. "$REPO/lib/restic-env.sh"
+
+DRY_RUN=0
+FORCE_MAINTENANCE=0
+FINISHED=0            # 1 once the run has succeeded
+FAILURE=""            # why the run failed, for the log and the push: no paths or names
+PREFLIGHT_FAILED=""   # the first failed preflight check, in its push version
+BACKUP_FOLDERS=()     # BACKUP_PATHS from .env, one folder per element
+MIN_FILES=0
+SOURCE_FILES=0
+BACKUP_NAME=Offsite   # the default; .env may set another
+NAME_PROBLEM=""
+NTFY_SERVER=""
+NTFY_TOPIC=""
+HC_PING_URL=""
+
+usage() {
+    cat <<'EOF'
+usage: backup [--dry-run | --maintenance]
+
+  (no option)     back up the folders in BACKUP_PATHS; once a week also prune and check
+  --maintenance   back up, then prune and check now
+  --dry-run       check everything and say what a run would do; changes nothing
+EOF
+}
+
+log() {
+    if (( DRY_RUN )); then
+        printf '%s\n' "$*"
+    else
+        printf '%s  %s\n' "$(date '+%F %T')" "$*" | tee -a "$LOG"
+    fi
+}
+
+die() {
+    FAILURE=$*
+    exit 1
+}
+
+as_duration() {
+    if (( $1 >= 3600 )); then
+        printf '%d h %d min' $(( $1 / 3600 )) $(( $1 % 3600 / 60 ))
+    elif (( $1 >= 60 )); then
+        printf '%d min %d s' $(( $1 / 60 )) $(( $1 % 60 ))
+    else
+        printf '%d s' "$1"
+    fi
+}
+
+# --- settings ------------------------------------------------------------------------
+
+# BACKUP_NAME, for the push titles. Plain ASCII only: it goes into an HTTP header.
+load_name() {
+    local name re='^[A-Za-z0-9][A-Za-z0-9 ._-]{0,39}$'
+    name=$(env_value BACKUP_NAME)
+    if [[ -z $name ]]; then
+        return 0
+    fi
+    if [[ $name =~ $re ]]; then
+        BACKUP_NAME=$name
+    else
+        NAME_PROBLEM="BACKUP_NAME in .env isn't 1-40 ASCII letters, digits, spaces or . _ -"
+    fi
+}
+
+# Sets BACKUP_FOLDERS and MIN_FILES. Returns 1, with the reason in CONFIG_PROBLEM, if a value
+# is missing or unusable.
+CONFIG_PROBLEM=""
+load_config() {
+    local raw folder parts=()
+    raw=$(env_value BACKUP_PATHS)
+    BACKUP_FOLDERS=()
+    if [[ -n $raw ]]; then
+        IFS=: read -r -a parts <<<"$raw"
+    fi
+    for folder in ${parts[@]+"${parts[@]}"}; do
+        if [[ -n $folder ]]; then
+            BACKUP_FOLDERS+=("$folder")
+        fi
+    done
+    if (( ${#BACKUP_FOLDERS[@]} == 0 )); then
+        CONFIG_PROBLEM="BACKUP_PATHS in .env is empty"
+        return 1
+    fi
+    for folder in "${BACKUP_FOLDERS[@]}"; do
+        if [[ $folder != /* ]]; then
+            CONFIG_PROBLEM="BACKUP_PATHS in .env holds a path that isn't absolute"
+            return 1
+        fi
+    done
+    MIN_FILES=$(env_value MIN_FILES)
+    if [[ ! $MIN_FILES =~ ^[1-9][0-9]*$ ]]; then
+        CONFIG_PROBLEM="MIN_FILES in .env is not a whole number above 0"
+        return 1
+    fi
+}
+
+# --- pushes and pings ----------------------------------------------------------------
+
+# Sets NTFY_SERVER and NTFY_TOPIC. Returns 1, with the reason in NTFY_PROBLEM, if a push
+# can't be sent. Never prints the values.
+NTFY_PROBLEM=""
+load_ntfy() {
+    NTFY_SERVER=$(env_value NTFY_SERVER)
+    NTFY_TOPIC=$(env_value NTFY_TOPIC)
+    if [[ ! $NTFY_SERVER =~ ^https://[A-Za-z0-9.-]+(:[0-9]+)?$ ]]; then
+        NTFY_PROBLEM="NTFY_SERVER in .env is not an https:// address without a path"
+        return 1
+    fi
+    if [[ ! $NTFY_TOPIC =~ ^[A-Za-z0-9_-]+$ || $NTFY_TOPIC == change-me ]]; then
+        NTFY_PROBLEM="NTFY_TOPIC in .env is empty, still the placeholder, or has odd characters"
+        return 1
+    fi
+}
+
+# push TITLE PRIORITY TAGS MESSAGE. The address goes to curl on stdin, so the topic is
+# not in the process list; curl's own messages are dropped, so it can't reach the log.
+push() {
+    local rc=0
+    if ! load_ntfy; then
+        log "no push sent: $NTFY_PROBLEM"
+        return 0
+    fi
+    printf 'url = "%s/%s"\n' "$NTFY_SERVER" "$NTFY_TOPIC" |
+        curl -fsS -m 20 --retry 2 -o /dev/null -K - \
+            -H "Title: $1" -H "Priority: $2" -H "Tags: $3" --data-binary "$4" 2>/dev/null || rc=$?
+    if (( rc == 0 )); then
+        log "push sent: $1"
+    else
+        log "WARNING: push not delivered (curl exit code $rc): $1"
+    fi
+}
+
+# Sets HC_PING_URL. Returns 1 if no ping is to be sent: not configured, or not usable
+# (then HC_PROBLEM says why).
+HC_PROBLEM=""
+load_hc() {
+    HC_PING_URL=$(env_value HC_PING_URL)
+    HC_PROBLEM=""
+    if [[ -z $HC_PING_URL ]]; then
+        return 1
+    fi
+    if [[ ! $HC_PING_URL =~ ^https://[A-Za-z0-9.-]+/[A-Za-z0-9/_-]+$ ]]; then
+        HC_PROBLEM="HC_PING_URL in .env is not an https:// ping address"
+        return 1
+    fi
+}
+
+# hc_ping SUFFIX: "" for success, /start or /fail. Without a body, so nothing about the
+# files leaves this Mac. The address goes to curl on stdin, like the ntfy topic.
+hc_ping() {
+    local rc=0
+    if ! load_hc; then
+        if [[ -n $HC_PROBLEM ]]; then
+            log "no healthchecks ping sent: $HC_PROBLEM"
+        fi
+        return 0
+    fi
+    printf 'url = "%s%s"\n' "$HC_PING_URL" "$1" |
+        curl -fsS -m 10 --retry 2 -o /dev/null -K - 2>/dev/null || rc=$?
+    if (( rc != 0 )); then
+        log "WARNING: healthchecks ping${1:-} not delivered (curl exit code $rc)"
+    fi
+}
+
+# --- restic --------------------------------------------------------------------------
+
+# run_restic ARGS...: restic, with its output in the log (indented behind "|") and in
+# RESTIC_OUT. Returns restic's exit code.
+run_restic() {
+    local rc line
+    set +e
+    restic "$@" 2>&1 | tee "$RESTIC_OUT" | while IFS= read -r line; do log "    | $line"; done
+    rc=${PIPESTATUS[0]}
+    set -e
+    return "$rc"
+}
+
+maintenance_due() {
+    if (( FORCE_MAINTENANCE )) || [[ ! -f $MAINTAINED ]]; then
+        return 0
+    fi
+    [[ -n $(find "$MAINTAINED" -mtime +"$MAINTENANCE_AGE" 2>/dev/null) ]]
+}
+
+# --- preflight -----------------------------------------------------------------------
+
+check_ok()   { log "  ok    $*"; }
+check_note() { log "  note  $*"; }
+# check_bad MESSAGE [PUSH_MESSAGE]: MESSAGE goes to the log. The first failure becomes the
+# reason in the push: PUSH_MESSAGE if given, for messages that name a path.
+check_bad() {
+    log "  FAIL  $1"
+    if [[ -z $PREFLIGHT_FAILED ]]; then
+        PREFLIGHT_FAILED=${2:-$1}
+    fi
+}
+
+# A mount point is on another device than the folder it sits in.
+is_mount_point() {
+    [[ -d $1 && $(stat -f %d "$1") != "$(stat -f %d "$1/..")" ]]
+}
+
+# check_folder FOLDER: its volume mounted, the folder readable (one byte of one file, as
+# the backup will read it: macOS may refuse a launchd job access to an external drive).
+# Adds its files to SOURCE_FILES. Returns 1 if it can't be backed up.
+check_folder() {
+    local folder=$1 volume rest sample count
+    if [[ $folder == /Volumes/* ]]; then
+        rest=${folder#/Volumes/}
+        volume=/Volumes/${rest%%/*}
+        if ! is_mount_point "$volume"; then
+            check_bad "$volume is not mounted" "a volume with a backup folder is not mounted"
+            return 1
+        fi
+    fi
+    sample=$(find "$folder" -type f ! -name .DS_Store ! -name '._*' 2>/dev/null | head -n 1 || true)
+    if [[ -z $sample ]] || ! head -c 1 "$sample" >/dev/null 2>&1; then
+        check_bad "$folder is missing or empty, or macOS doesn't let this job read it (README.md, \"macOS privacy\")" \
+            "a backup folder is missing or empty, or macOS doesn't let this job read it (README.md, \"macOS privacy\")"
+        return 1
+    fi
+    count=$(find "$folder" -type f ! -name .DS_Store ! -name '._*' 2>/dev/null | wc -l | tr -d ' ')
+    SOURCE_FILES=$(( SOURCE_FILES + count ))
+    check_ok "$folder: readable, $count files"
+}
+
+preflight() {
+    local folder folders_ok=1
+    log "preflight:"
+
+    if command -v restic >/dev/null; then
+        check_ok "$(restic version | awk '{print $1, $2}')"
+    else
+        check_bad "restic is not installed (brew install restic)"
+    fi
+
+    if load_config; then
+        for folder in "${BACKUP_FOLDERS[@]}"; do
+            check_folder "$folder" || folders_ok=0
+        done
+        if (( folders_ok )); then
+            if (( SOURCE_FILES >= MIN_FILES )); then
+                check_ok "$SOURCE_FILES files in all, at least $MIN_FILES expected"
+            else
+                check_bad "only $SOURCE_FILES files in the backup folders, expected at least $MIN_FILES (MIN_FILES)"
+            fi
+        fi
+    else
+        check_bad "$CONFIG_PROBLEM"
+    fi
+
+    if load_repository; then
+        check_ok "RESTIC_REPOSITORY in .env"
+    else
+        check_bad "$ENV_PROBLEM"
+    fi
+    if [[ -n $NAME_PROBLEM ]]; then
+        check_note "$NAME_PROBLEM; pushes say \"$BACKUP_NAME backup\""
+    fi
+    if load_ntfy; then
+        check_ok "ntfy settings in .env"
+    else
+        check_note "no push will be sent: $NTFY_PROBLEM"
+    fi
+    if load_hc; then
+        check_ok "healthchecks ping address in .env"
+    elif [[ -n $HC_PROBLEM ]]; then
+        check_note "no healthchecks ping will be sent: $HC_PROBLEM"
+    else
+        check_note "no healthchecks ping configured (HC_PING_URL in .env)"
+    fi
+
+    if load_secrets; then
+        check_ok "B2 key and repository password in the keychain"
+    else
+        check_bad "$ENV_PROBLEM"
+    fi
+
+    # Reading the config needs the network, the B2 key and the password: one check for all
+    # three. restic's message goes to the log only; it may name the bucket.
+    if [[ -z $PREFLIGHT_FAILED ]]; then
+        if restic cat config --no-lock >"$RESTIC_OUT" 2>&1; then
+            check_ok "the repository answers and the password opens it"
+        else
+            sed 's/^/    | /' "$RESTIC_OUT" | while IFS= read -r line; do log "$line"; done
+            check_bad "can't open the repository (no network, wrong key or wrong password; the log has restic's message)"
+        fi
+    fi
+}
+
+# --- runs ----------------------------------------------------------------------------
+
+dry_run() {
+    log "backup --dry-run: nothing in the backup will change."
+    mkdir -p "$STATE_DIR"
+    preflight
+    log ""
+    if [[ -n $PREFLIGHT_FAILED ]]; then
+        log "A run would stop here: $PREFLIGHT_FAILED."
+        log "It would send the push '$BACKUP_NAME backup FAILED' and write nothing."
+        exit 1
+    fi
+    log "A run would:"
+    log "  - back up ${#BACKUP_FOLDERS[@]} folder(s), $SOURCE_FILES files, tag $TAG, without .DS_Store and ._* files"
+    if maintenance_due; then
+        log "  - do the weekly maintenance: forget ${KEEP[*]} --prune, then check $CHECK_SUBSET of the data"
+        log "  - send the push '$BACKUP_NAME backup OK' (low priority)"
+    else
+        log "  - skip maintenance (the last one passed less than a week ago)"
+    fi
+    if load_hc; then
+        log "  - ping healthchecks at the start and the end"
+    fi
+}
+
+finish() {
+    local rc=$?
+    trap - EXIT
+    set +e
+    if (( ! FINISHED )); then
+        if (( rc == 0 )); then
+            rc=1
+        fi
+        if [[ -z $FAILURE ]]; then
+            FAILURE="unexpected error (exit code $rc), see the log"
+        fi
+        log "FAILED: $FAILURE"
+        hc_ping /fail
+        push "$BACKUP_NAME backup FAILED" high "x,floppy_disk" "$FAILURE."
+    fi
+    log "=== backup ended after $(as_duration "$SECONDS"), exit code $rc ==="
+    exit "$rc"
+}
+
+maintenance() {
+    local rc=0
+    log "restic forget --prune:"
+    run_restic forget --tag "$TAG" "${KEEP[@]}" --prune || rc=$?
+    if (( rc != 0 )); then
+        die "restic forget/prune failed (exit code $rc, see the log)"
+    fi
+    log "restic check --read-data-subset=$CHECK_SUBSET:"
+    run_restic check --read-data-subset="$CHECK_SUBSET" || rc=$?
+    if (( rc != 0 )); then
+        die "restic check found a problem or could not run (exit code $rc, see the log)"
+    fi
+    touch "$MAINTAINED"
+}
+
+backup_run() {
+    local rc=0 files added summary snapshots stored
+    trap finish EXIT
+    trap 'FAILURE="interrupted"; exit 130' HUP INT TERM
+    log "=== backup started ==="
+    hc_ping /start
+
+    preflight
+    if [[ -n $PREFLIGHT_FAILED ]]; then
+        die "preflight: $PREFLIGHT_FAILED"
+    fi
+
+    # From a terminal (the first, long run): a progress line in the log once a minute.
+    if [[ -t 1 ]]; then
+        export RESTIC_PROGRESS_FPS=0.0167
+    fi
+    log "restic backup:"
+    run_restic backup --tag "$TAG" "${EXCLUDES[@]}" "${BACKUP_FOLDERS[@]}" || rc=$?
+    unset RESTIC_PROGRESS_FPS
+    case $rc in
+        0) ;;
+        3) die "some files could not be read, so the snapshot is incomplete (the log names them)" ;;
+        *) die "restic backup failed (exit code $rc, see the log)" ;;
+    esac
+    # "Files:  20 new,  0 changed,  1000 unmodified" and "Added to the repository: 1.5 GiB (...)"
+    files=$(sed -n 's/^Files: *//p' "$RESTIC_OUT" | tail -1 | tr -s ' ')
+    added=$(sed -n 's/^Added to the repository: //p' "$RESTIC_OUT" | tail -1)
+    summary="Files: ${files:-?}. Added: ${added:-?}."
+
+    if maintenance_due; then
+        maintenance
+        snapshots=$(restic snapshots --tag "$TAG" --json --no-lock 2>/dev/null | grep -o '"short_id"' | wc -l | tr -d ' ')
+        stored=$(restic stats --mode raw-data --no-lock 2>/dev/null | sed -n 's/^ *Total Size: *//p' | tail -1)
+        summary="$summary Weekly check passed ($CHECK_SUBSET of the data read back). ${snapshots:-?} snapshots, ${stored:-?} stored. $(as_duration "$SECONDS")."
+        FINISHED=1
+        log "DONE: $summary"
+        hc_ping ""
+        push "$BACKUP_NAME backup OK" low "white_check_mark,floppy_disk" "$summary"
+    else
+        FINISHED=1
+        log "DONE: $summary"
+        hc_ping ""
+    fi
+}
+
+# --- start here ----------------------------------------------------------------------
+
+case "${1:-}" in
+    "")             ;;
+    --dry-run)      DRY_RUN=1 ;;
+    --maintenance)  FORCE_MAINTENANCE=1 ;;
+    -h|--help)      usage; exit 0 ;;
+    *)              usage >&2; exit 2 ;;
+esac
+if (( $# > 1 )); then
+    usage >&2
+    exit 2
+fi
+
+load_name
+
+if (( DRY_RUN )); then
+    dry_run
+    exit 0
+fi
+
+mkdir -p "$STATE_DIR" "$(dirname "$LOG")"
+
+# One run at a time: start this script again under a lock that the system releases when
+# the process ends, however it ends.
+if [[ ${RESTIC_B2_MACOS_LOCKED:-} != 1 ]]; then
+    rc=0
+    RESTIC_B2_MACOS_LOCKED=1 lockf -k -s -t 0 "$LOCK" "$SELF" "$@" || rc=$?
+    if (( rc == 75 )); then
+        log "another backup run is in progress; this one does nothing"
+    fi
+    exit "$rc"
+fi
+
+backup_run

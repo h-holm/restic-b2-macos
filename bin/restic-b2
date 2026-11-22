@@ -1,0 +1,29 @@
+#!/bin/bash
+#
+# restic-b2: restic, pointed at the repository in .env, with the B2 key and the password
+# from the login keychain. Everything after the name goes to restic. Examples:
+#
+#   bin/restic-b2 snapshots
+#   bin/restic-b2 ls latest /Volumes/External/Photos/2017
+#   bin/restic-b2 find 'IMG_2041*'
+#   bin/restic-b2 restore latest --include /Volumes/External/Photos/2017 --target ~/restored
+#   bin/restic-b2 check --read-data-subset=10%
+#
+# Commands that delete (forget, prune, key remove) work too: think twice. The schedule's
+# retention is in bin/backup.
+#
+# Written for the bash 3.2 that macOS ships as /bin/bash.
+
+set -euo pipefail
+export PATH=/opt/homebrew/bin:/usr/bin:/bin:/usr/sbin:/sbin:/usr/local/bin   # Homebrew: Apple Silicon, Intel
+
+REPO=$(cd "$(dirname "$0")/.." && pwd)
+readonly REPO
+# shellcheck source=lib/restic-env.sh
+. "$REPO/lib/restic-env.sh"
+
+if ! load_repository || ! load_secrets; then
+    echo "restic-b2: $ENV_PROBLEM" >&2
+    exit 1
+fi
+exec restic "$@"
