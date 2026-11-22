@@ -1,0 +1,4 @@
+.env
+*.log
+.DS_Store
+/launchd/restic-b2-launcher
