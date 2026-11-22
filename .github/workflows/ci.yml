@@ -1,0 +1,55 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  lint:
+    name: shellcheck and the launcher's C
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: shellcheck
+        run: shellcheck -x bin/* lib/*.sh
+
+      - name: The launcher builds without warnings
+        run: |
+          cc -O2 -Wall -Wextra -Werror -DSCRIPT='"/path/to/bin/backup"' \
+            -o "$RUNNER_TEMP/restic-b2-launcher" launchd/restic-b2-launcher.c
+
+  macos:
+    name: macOS (bash 3.2, plutil, launchd files)
+    runs-on: macos-15
+    needs: lint
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: The scripts parse with the bash 3.2 that macOS ships
+        run: for f in bin/* lib/restic-env.sh; do /bin/bash -n "$f"; done
+
+      - name: The rendered LaunchAgent is a valid plist
+        run: |
+          cp .env.example .env
+          bin/schedule show > "$RUNNER_TEMP/agent.plist"
+          plutil -lint "$RUNNER_TEMP/agent.plist"
+
+      - name: The launcher builds and accepts only --dry-run
+        run: |
+          cc -O2 -Wall -Wextra -Werror "-DSCRIPT=\"$PWD/bin/backup\"" \
+            -o launchd/restic-b2-launcher launchd/restic-b2-launcher.c
+          rc=0; launchd/restic-b2-launcher --unknown 2>/dev/null || rc=$?
+          test "$rc" -eq 2
+
+      - name: A dry run with the example settings stops in preflight
+        run: |
+          cp .env.example .env
+          rc=0; bin/backup --dry-run > "$RUNNER_TEMP/dry-run.txt" || rc=$?
+          cat "$RUNNER_TEMP/dry-run.txt"
+          test "$rc" -eq 1
+          grep -q 'A run would stop here' "$RUNNER_TEMP/dry-run.txt"
